@@ -1,231 +1,288 @@
 import streamlit as st
-import pandas as pd
-import json
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timedelta
 from io import BytesIO
 
-from reportlab.lib.pagesizes import LETTER
-from reportlab.pdfgen import canvas
+st.set_page_config(
+    page_title="BUMP — Panel Diario",
+    layout="centered",
+    page_icon="💧"
+)
 
-# ------------------ Storage ------------------
-DATA_DIR = Path("data_bump")
-DATA_DIR.mkdir(exist_ok=True)
-JOURNAL_FILE = DATA_DIR / "journal.json"
-
-# ------------------ Fórmulas ------------------
-def mifflin_women_bmr(weight_kg: float, height_cm: float, age: int) -> float:
-    # GEB mujeres = (10*kg) + (6.25*cm) - (5*edad) - 161
-    return (10 * weight_kg) + (6.25 * height_cm) - (5 * age) - 161
-
-ACTIVITY_FACTORS = {
-    "Sedentaria (1.2)": 1.2,
-    "Ligera 1–3 días/sem (1.375)": 1.375,
-    "Moderada 3–5 días/sem (1.55)": 1.55,
-    "Intensa 6–7 días/sem (1.725)": 1.725,
-    "Muy intensa / trabajo físico (1.9)": 1.9,
+# -----------------------------
+# Estilos (limpio y amigable)
+# -----------------------------
+st.markdown("""
+<style>
+.big-card {
+    padding: 18px;
+    border-radius: 16px;
+    border: 1px solid rgba(0,0,0,0.08);
+    background: rgba(255,255,255,0.70);
 }
+.kpi {
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.1;
+}
+.kpi-sub {
+    font-size: 0.95rem;
+    opacity: 0.82;
+}
+.small-note {
+    font-size: 0.95rem;
+    opacity: 0.82;
+}
+hr { margin: 1rem 0; }
+</style>
+""", unsafe_allow_html=True)
 
-# Proteína automática según actividad (mínimo > 1.2 => arrancamos en 1.3 g/kg)
-def protein_factor_from_activity(activity_factor: float) -> float:
-    if activity_factor <= 1.375:
+# -----------------------------
+# Reglas (las mismas que ya definimos)
+# -----------------------------
+def nivel_por_dias(dias: int) -> str:
+    if dias == 0:
+        return "Sedentaria"
+    if 1 <= dias <= 3:
+        return "Ligera"
+    if 4 <= dias <= 5:
+        return "Moderada"
+    return "Intensa"  # 6-7
+
+def factor_proteina_por_nivel(nivel: str) -> float:
+    # Todas arriba de 1.2 (como pediste)
+    if nivel in ["Sedentaria", "Ligera"]:
         return 1.3
-    elif activity_factor <= 1.55:
+    if nivel == "Moderada":
         return 1.5
-    elif activity_factor <= 1.725:
-        return 1.7
-    else:
-        return 1.9
+    return 1.7  # Intensa
 
-WATER_PRESETS = {
-    "30 ml/kg": 30,
-    "35 ml/kg": 35,
-}
+def meta_dias_recomendada(dias: int):
+    """
+    Recomendación clara:
+    - Base mínima: 3 días/sem
+    - Ideal: 4–5 días/sem
+    - Si ya hace 6–7: mantener y priorizar recuperación
+    """
+    if dias == 0:
+        return ("Meta mínima", 3, "Empieza con 3 días/semana (20–30 min) suave.")
+    if 1 <= dias <= 2:
+        return ("Meta mínima", 3, "Súbele a 3 días/semana para crear consistencia.")
+    if dias == 3:
+        return ("Meta ideal", 4, "Vas bien. Si puedes, sube a 4 días/semana.")
+    if dias == 4:
+        return ("Meta ideal", 5, "Excelente. Si te sientes bien, apunta a 5 días/semana.")
+    if dias == 5:
+        return ("Mantén", 5, "Perfecto. Mantén 5 días/semana.")
+    return ("Alto nivel", 6, "Muy bien. Prioriza descanso, sueño y 1 día suave.")
 
-# ------------------ Diario ------------------
-def load_journal():
-    if JOURNAL_FILE.exists():
-        return json.loads(JOURNAL_FILE.read_text(encoding="utf-8"))
-    return []
+def build_ics(title: str, start_dt: datetime, duration_min: int, count: int, interval_hours: int):
+    """
+    Crea un .ics con eventos repetidos (count eventos)
+    """
+    def fmt(dt: datetime) -> str:
+        return dt.strftime("%Y%m%dT%H%M%S")
 
-def save_journal(entries):
-    JOURNAL_FILE.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    # ICS básico (sin timezone explícito para que el calendario lo ajuste local)
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//TFRM//BUMP//ES",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
 
-def journal_to_pdf_bytes(entries):
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=LETTER)
-    width, height = LETTER
+    uid_base = f"{int(datetime.now().timestamp())}@tfrm-bump"
 
-    y = height - 50
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, y, "TFRM BUMP — Diario de Agradecimiento")
-    y -= 25
+    for i in range(count):
+        s = start_dt + timedelta(hours=i * interval_hours)
+        e = s + timedelta(minutes=duration_min)
+        uid = f"{uid_base}-{i}"
 
-    c.setFont("Helvetica", 10)
-    c.drawString(50, y, f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    y -= 25
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{fmt(datetime.now())}",
+            f"DTSTART:{fmt(s)}",
+            f"DTEND:{fmt(e)}",
+            f"SUMMARY:{title}",
+            "END:VEVENT",
+        ]
 
-    if not entries:
-        c.drawString(50, y, "No hay entradas aún.")
-        c.showPage()
-        c.save()
-        buffer.seek(0)
-        return buffer.getvalue()
+    lines.append("END:VCALENDAR")
+    return "\n".join(lines).encode("utf-8")
 
-    for idx, e in enumerate(entries, start=1):
-        fecha = e.get("timestamp", "").replace("T", " ")
-        grat = e.get("gratitud", [])
-        note = e.get("nota", "")
+# -----------------------------
+# UI
+# -----------------------------
+st.title("BUMP — Panel Diario")
+st.caption("Agua • Proteína • Actividad (simple, claro y para usar diario)")
 
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, y, f"Entrada #{idx} — {fecha}")
-        y -= 16
+tab1, tab2 = st.tabs(["📌 Mi Panel", "⏰ Recordatorios"])
 
-        c.setFont("Helvetica", 10)
-        for i, g in enumerate(grat, start=1):
-            c.drawString(65, y, f"{i}) {g}")
-            y -= 14
-
-        if note:
-            c.setFont("Helvetica-Oblique", 9)
-            c.drawString(65, y, f"Nota: {note[:120]}")
-            y -= 14
-
-        y -= 8
-
-        # salto de página
-        if y < 80:
-            c.showPage()
-            y = height - 50
-
-    c.showPage()
-    c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
-
-# ------------------ UI ------------------
-st.set_page_config(page_title="TFRM BUMP — Panel de Control", layout="wide")
-
-st.title("TFRM BUMP — Panel de Control")
-st.caption("Calorías (GET) + Proteína + Agua + Diario de Agradecimiento")
-
-tab1, tab2 = st.tabs(["📊 Panel", "📝 Diario"])
-
-# ---------- TAB 1: Panel ----------
+# -----------------------------
+# TAB 1 — Mi Panel
+# -----------------------------
 with tab1:
-    colA, colB = st.columns([1, 1])
+    st.markdown('<div class="big-card">', unsafe_allow_html=True)
+    st.subheader("Tus datos")
+
+    peso_kg = st.number_input("Tu peso (kg)", min_value=30.0, max_value=250.0, value=70.0, step=0.1)
+    dias_ejercicio = st.slider("¿Cuántos días a la semana haces actividad física?", 0, 7, 3)
+
+    agua_op = st.radio(
+        "Agua por kg (elige 1 opción)",
+        options=["30 ml por kg (normal)", "35 ml por kg (calor / sudas más)"],
+        index=1,
+        horizontal=True
+    )
+
+    st.markdown('<p class="small-note">Tip: si vives en clima caluroso (Q. Roo/Yucatán), casi siempre 35 ml/kg.</p>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Cálculos
+    ml_por_kg = 30 if "30 ml" in agua_op else 35
+    agua_ml = peso_kg * ml_por_kg
+    agua_l = agua_ml / 1000
+
+    nivel = nivel_por_dias(dias_ejercicio)
+    prot_factor = factor_proteina_por_nivel(nivel)
+    proteina_g = peso_kg * prot_factor
+
+    meta_tipo, meta_dias, meta_texto = meta_dias_recomendada(dias_ejercicio)
+
+    st.markdown("---")
+    st.subheader("Tus números del día")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown('<div class="big-card">', unsafe_allow_html=True)
+        st.markdown("💧 **Agua recomendada**")
+        st.markdown(f'<div class="kpi">{agua_l:.2f} L</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-sub">({agua_ml:,.0f} ml/día • {ml_por_kg} ml/kg)</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with c2:
+        st.markdown('<div class="big-card">', unsafe_allow_html=True)
+        st.markdown("🍗 **Proteína recomendada**")
+        st.markdown(f'<div class="kpi">{proteina_g:,.0f} g</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-sub">({prot_factor} g/kg según tu actividad)</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("")
+    st.markdown('<div class="big-card">', unsafe_allow_html=True)
+    st.markdown("🏃‍♀️ **Actividad física**")
+    st.write(f"**Tu nivel actual:** {nivel} (por {dias_ejercicio} días/semana)")
+    st.write(f"**{meta_tipo}:** {meta_dias} días/semana")
+    st.write(f"**Sugerencia:** {meta_texto}")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.caption("Educativo y de apoyo. Si estás embarazada/lactando o con condiciones médicas, consulta a un profesional.")
+
+# -----------------------------
+# TAB 2 — Recordatorios
+# -----------------------------
+with tab2:
+    st.subheader("Recordatorios de agua")
+    st.caption("Aquí puedes llevar checklist y generar horarios sugeridos (descargables).")
+
+    # Reutilizar inputs (si el usuario aún no fue a Tab 1)
+    # Tomamos valores con defaults si no existen en sesión
+    peso_kg_2 = st.session_state.get("peso_kg", None)
+    # Streamlit no guarda automáticamente las variables; entonces recalculamos con inputs sencillos aquí:
+    colA, colB = st.columns(2)
 
     with colA:
-        st.subheader("Datos")
-        age = st.number_input("Edad (años)", min_value=12, max_value=90, value=35, step=1)
-        weight = st.number_input("Peso (kg)", min_value=30.0, max_value=250.0, value=70.0, step=0.1)
-        height = st.number_input("Estatura (cm)", min_value=120.0, max_value=220.0, value=160.0, step=0.5)
-
-        activity_label = st.selectbox("Actividad física", list(ACTIVITY_FACTORS.keys()), index=2)
-        activity_factor = ACTIVITY_FACTORS[activity_label]
-
-        st.divider()
-        st.subheader("Agua")
-        water_label = st.selectbox("Agua (ml/kg)", list(WATER_PRESETS.keys()), index=1)
-        water_mlkg = WATER_PRESETS[water_label]
+        peso_r = st.number_input("Tu peso (kg) (para recordatorios)", min_value=30.0, max_value=250.0, value=70.0, step=0.1, key="peso_recordatorios")
+        agua_factor = st.radio("Factor de agua", ["30 ml/kg", "35 ml/kg"], index=1, horizontal=True, key="agua_factor_recordatorios")
 
     with colB:
-        st.subheader("Resultados")
-        bmr = mifflin_women_bmr(weight, height, age)
-        get = bmr * activity_factor
+        presentacion = st.selectbox("¿Cómo la prefieres medir?", ["Vasos de 250 ml", "Botellas de 500 ml", "Litros"], index=1)
+        horas_despierta = st.slider("Horas despierta al día (aprox.)", 10, 18, 14)
 
-        protein_factor = protein_factor_from_activity(activity_factor)
-        protein_g = weight * protein_factor
+    mlkg = 30 if agua_factor == "30 ml/kg" else 35
+    agua_ml_r = peso_r * mlkg
+    agua_l_r = agua_ml_r / 1000
 
-        water_ml = weight * water_mlkg
-        water_l = water_ml / 1000
+    # Convertir a "unidades" para checklist
+    if presentacion == "Vasos de 250 ml":
+        unidad_ml = 250
+        unidades = int(round(agua_ml_r / unidad_ml))
+        unidad_txt = "vasos"
+    elif presentacion == "Botellas de 500 ml":
+        unidad_ml = 500
+        unidades = int(round(agua_ml_r / unidad_ml))
+        unidad_txt = "botellas"
+    else:
+        unidades = int(round(agua_l_r))
+        unidad_txt = "litros"
+        unidad_ml = None
 
-        k1, k2, k3 = st.columns(3)
-        k1.metric("GEB (Mifflin)", f"{bmr:,.0f} kcal")
-        k2.metric("GET (con actividad)", f"{get:,.0f} kcal")
-        k3.metric("Proteína", f"{protein_g:,.0f} g/día")
+    st.markdown('<div class="big-card">', unsafe_allow_html=True)
+    st.markdown("✅ **Meta de agua de hoy**")
+    st.markdown(f'<div class="kpi">{agua_l_r:.2f} L</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-sub">{agua_ml_r:,.0f} ml/día • {mlkg} ml/kg</div>', unsafe_allow_html=True)
+    st.markdown(f"<div class='kpi-sub'>Equivale aprox. a <b>{unidades} {unidad_txt}</b>.</div>", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-        st.write("")
-        st.info(
-            f"**Actividad:** {activity_factor}  \n"
-            f"**Proteína automática:** {protein_factor} g/kg  \n"
-            f"**Agua:** {water_ml:,.0f} ml/día (**{water_l:,.2f} L**) — {water_mlkg} ml/kg"
-        )
+    st.markdown("---")
+    st.subheader("Checklist rápido")
 
-        snapshot = pd.DataFrame([{
-            "fecha": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "edad": age,
-            "peso_kg": weight,
-            "estatura_cm": height,
-            "actividad": activity_label,
-            "factor_actividad": activity_factor,
-            "GEB_kcal": round(bmr, 0),
-            "GET_kcal": round(get, 0),
-            "proteina_g": round(protein_g, 0),
-            "proteina_factor_gkg": protein_factor,
-            "agua_ml": round(water_ml, 0),
-            "agua_mlkg": water_mlkg,
-        }])
+    # Checklist: 12 slots máximo para no saturar
+    max_slots = min(max(unidades, 1), 12) if unidad_txt != "litros" else min(max(unidades, 1), 8)
+    st.caption("Marca conforme vas avanzando. (Se reinicia si recargas la página)")
 
-        st.download_button(
-            "⬇️ Descargar cálculo (CSV)",
-            data=snapshot.to_csv(index=False).encode("utf-8"),
-            file_name="tfrm_bump_calculo.csv",
-            mime="text/csv"
-        )
+    checks = []
+    cols = st.columns(4)
+    for i in range(max_slots):
+        with cols[i % 4]:
+            checks.append(st.checkbox(f"{i+1}", key=f"chk_{i}"))
 
-# ---------- TAB 2: Diario ----------
-with tab2:
-    st.subheader("Diario de agradecimiento")
-    st.caption("5 agradecimientos + historial + export a PDF")
+    hecho = sum(checks)
+    st.progress(min(hecho / max_slots, 1.0))
+    st.write(f"Progreso: **{hecho}/{max_slots}**")
 
-    entries = load_journal()
+    st.markdown("---")
+    st.subheader("Horarios sugeridos")
+    st.caption("Genera un plan simple para tomar agua durante el día y descárgalo al calendario (.ics).")
 
-    col1, col2 = st.columns([1, 1])
-
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.markdown("**Hoy agradezco:**")
-        a1 = st.text_input("1)", "")
-        a2 = st.text_input("2)", "")
-        a3 = st.text_input("3)", "")
-        a4 = st.text_input("4)", "")
-        a5 = st.text_input("5)", "")
-        note = st.text_area("Nota (opcional)", "", height=90)
-
-        if st.button("💾 Guardar entrada"):
-            new_entry = {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "gratitud": [x for x in [a1, a2, a3, a4, a5] if x.strip()],
-                "nota": note.strip()
-            }
-            entries.insert(0, new_entry)
-            save_journal(entries)
-            st.success("Entrada guardada.")
-
-        pdf_bytes = journal_to_pdf_bytes(entries)
-        st.download_button(
-            "⬇️ Descargar diario (PDF)",
-            data=pdf_bytes,
-            file_name="tfrm_bump_diario.pdf",
-            mime="application/pdf"
-        )
-
+        hora_inicio = st.time_input("Empiezo a tomar agua a las", value=datetime.strptime("08:00", "%H:%M").time())
     with col2:
-        st.markdown("**Historial**")
-        if entries:
-            df = pd.DataFrame([{
-                "fecha": e["timestamp"].replace("T", " "),
-                "gratitud": " | ".join(e.get("gratitud", [])),
-                "nota": e.get("nota", "")
-            } for e in entries])
+        intervalo_h = st.selectbox("Cada cuántas horas", [2, 3], index=0)
+    with col3:
+        duracion_min = st.selectbox("Duración del recordatorio (min)", [5, 10, 15], index=1)
 
-            st.dataframe(df, use_container_width=True, height=360)
+    # Cantidad de recordatorios según horas despierta
+    # (p.ej. 14h / 2h = 7 recordatorios)
+    count = max(1, int(round(horas_despierta / intervalo_h)))
 
-            st.download_button(
-                "⬇️ Descargar historial (CSV)",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="tfrm_bump_journal.csv",
-                mime="text/csv"
-            )
-        else:
-            st.write("Aún no hay entradas.")
+    hoy = datetime.now()
+    start_dt = datetime.combine(hoy.date(), hora_inicio)
+
+    # Texto para mostrar horario
+    horarios = [(start_dt + timedelta(hours=i * intervalo_h)).strftime("%I:%M %p") for i in range(count)]
+
+    st.markdown('<div class="big-card">', unsafe_allow_html=True)
+    st.write(f"Te quedan **{count} recordatorios** hoy (cada {intervalo_h} horas).")
+    st.write("Horarios sugeridos:")
+    st.write(" • " + "  |  ".join(horarios))
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    ics_bytes = build_ics(
+        title="💧 Toma agua (BUMP)",
+        start_dt=start_dt,
+        duration_min=duracion_min,
+        count=count,
+        interval_hours=intervalo_h
+    )
+
+    st.download_button(
+        "⬇️ Descargar recordatorios para Calendario (.ics)",
+        data=ics_bytes,
+        file_name="bump_recordatorios_agua.ics",
+        mime="text/calendar"
+    )
+
+    st.caption("Tip: abre el .ics en tu celular y ‘Agregar a Calendario’ para que te aparezcan los recordatorios.")
